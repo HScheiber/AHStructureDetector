@@ -1,0 +1,1 @@
+This is is my Alkali Halide Structure Detector Library
