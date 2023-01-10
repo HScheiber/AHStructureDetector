@@ -1,0 +1,55 @@
+; Sphalerite LiI with JC_Model_Alexandria model, v-rescale thermostat, and Parrinello-Rahman barostat.
+
+; Output control
+nstxout                  = 1000              ; Number of steps that elapse between writing coordinates to output trajectory file, the last coordinates are always written
+nstvout                  = 0                 ; Number of steps that elapse between writing velocities to output trajectory, the last velocities are always written
+nstfout                  = 0                 ; Number of steps that elapse between writing forces to output trajectory.
+nstenergy                = 1000              ; Number of steps that elapse between writing energies to output trajectory.
+nstcalcenergy            = 100               ; Number of steps that elapse between calculating the energies, 0 is never
+
+; Parameters for run
+coulombtype              = PME-User          ; Define how the coulombic interaction is calculated
+vdwtype                  = user              ; Define the type of van der waals potential used
+vdw-modifier             = none              ; Define the behaviour of the vdw potential at the cutoff
+nsteps                   = 50000             ; How many MD steps are performed (10 ns)
+integrator               = md                ; What type of calculation is run
+dt                       = 0.001             ; Time step (ps)
+energygrps               = Li I           ; Input all groups here
+energygrp-table          = I I Li I Li Li   ; Names for input tables (used for some forcefields)
+cutoff-scheme            = group             ; One of Group or Verlet
+ns-type                  = grid              ; Method to determine neighbor list (simple, grid)
+rlist                    = 1.1               ; Sets the search radius for neighbour list generation
+rcoulomb                 = 1.1               ; Real space coulomb cutoff radius
+rvdw                     = 1                 ; Van der Waals cutoff radius
+pbc                      = xyz               ; Periodic Boundary Conditions (yes/no)
+constraints              = none              ; Bonding constraints
+nstlist                  = 10                ; Frequency to update the neighbor list and long range forces
+fourierspacing           = 0.12              ; Grid dimensions in PME are controlled with fourierspacing
+pme-order                = 4                 ; Interpolation order for PME. 4 equals cubic interpolation.
+ewald-rtol               = 1e-05             ; The relative strength of the Ewald-shifted direct potential at rcoulomb.
+continuation             = no                ; Yes = do not apply constraints to the start configuration and do not reset shells, useful for exact continuation and reruns
+
+; Temperature Coupling
+tcoupl                   = v-rescale         ; The type of thermostat
+tc-grps                  = System           ; Groups to couple seperately to temperature bath
+tau-t                    = 0.2               ; [ps] time constant for coupling. Need one for each energy group.
+nsttcouple               = 10                ; The frequency for coupling the temperature.
+ref-t                    = 500               ; [K] Reference temperature for coupling. Need one for each group.
+
+; Simulated annealing
+annealing                = no                ; Type of annealing for each temperature group. Set to 'no' to disable
+
+; Pressure Coupling
+pcoupl                   = Parrinello-Rahman ; Type of barostat used. Set to 'no' for fixed volume.
+pcoupltype               = isotropic         ; Pressure coupling isotropy
+tau-p                    = 1                 ; [ps] Time constant for barostat coupling
+nstpcouple               = 50                ; The frequency for coupling the Pressure.
+compressibility          = 5.1813e-06        ; [bar^-1] Compressibility of box.
+ref-p                    = 1                 ; [bar] Reference pressure for coupling
+
+; Initial Velocity Generation
+gen-vel                  = no                ; Velocity generation switch
+
+
+; Long-range dispersion correction
+DispCorr                 = EnerPres          ; apply long range dispersion corrections for Energy and pressure

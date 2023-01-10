@@ -1,32 +1,54 @@
-def Check_Structures(WorkDir, Salt, SystemName=None,
-                        SaveTrajectory=True, SaveFeatures=False, 
-                        SavePredictions=False, SavePredictionsImage=True, 
-                        ML_TimeLength=5, ML_TimeStep=1, TimePerFrame=1, 
-                        FileType='gro', Verbose=False, StartPoint = None,
-                        EndPoint = None, Version = 2, SaveDir = None,
-                        InMemory = False, Temporal_Cutoff = 0,
-                        Voronoi = False, Qlm_Average = False,
-                        Prob_Interfacial = None,
-                        Spatial_Reassignment = False,
-                        Spatial_Interfacial = None,
-                        SaveTrajectoryAux = 2,
-                        LoadFeatures = False):
+# % Import libraries and define functions
+import os
+import tensorflow as tf
+import MDAnalysis as md
+import numpy as np
+import freud
+import time
+import re
+import warnings
+import logging
+import collections
+import pickle
+from itertools import groupby
+import seaborn as sns
+import matplotlib.pyplot as plt
+freud.parallel.set_num_threads(nthreads=os.cpu_count())
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # or any {'0', '1', '2'}
+
+def Check_Structures(WorkDir=None, Salt=None, SystemName=None, SaveTrajectory=True, 
+                     SaveFeatures=False, SavePredictions=False, SavePredictionsImage=True, 
+                     ML_TimeLength=0, ML_TimeStep=0, TimePerFrame=1, FileType='gro', 
+                     Verbose=False, StartPoint=None, EndPoint=None, SaveDir=None, 
+                     InMemory=False, Temporal_Cutoff=0, Voronoi=False, Qlm_Average=True,
+                     Prob_Interfacial=None, Spatial_Reassignment=False,
+                     Spatial_Interfacial=None, SaveTrajectoryAux=2, LoadFeatures=False):
     
     """
-    Created on Fri Nov 20 18:54:17 2020
     
-    This function determines whether a LiX simulation has melted or frozen, 
-    and returns a list of outputs.
-    Outputs:
+    Check_Structures(WorkDir=None, Salt=None, SystemName=None, SaveTrajectory=True, 
+                         SaveFeatures=False, SavePredictions=False, SavePredictionsImage=True, 
+                         ML_TimeLength=5, ML_TimeStep=1, TimePerFrame=1, FileType='gro', 
+                         Verbose=False, StartPoint=None, EndPoint=None, SaveDir=None, 
+                         InMemory=False, Temporal_Cutoff=0, Voronoi=False, Qlm_Average=False,
+                         Prob_Interfacial=None, Spatial_Reassignment=False,
+                         Spatial_Interfacial=None, SaveTrajectoryAux=2, LoadFeatures=False)
         
-    Inputs (Required):
-        WorkDir                 The directory containing the trajectory, 
-                                and will also contain any output files.
-        Salt                    The LiX salt.
+    This function runs through a GROMACS .trr trajectory + .gro file and analyzes the file
+    using the alkali halide structure classifiers of https://doi.org/10.1063/5.0122274
+    No output is returned directly by this function, by the function may produce
+    several output files, including a classified .xyz trajectory file, a pickle file
+    containing the calculated input features, a pickle file containing the classification 
+    outputs, and a plot of structure fraction vs time for the system of interest.
         
     Inputs (Optional):
-        SystemName              The name of the files involved in this calculation.
-        T                       The actual system temperature.
+        WorkDir                 The directory containing the trajectory, 
+                                and will also contain any output files. 
+                                Default is the current working directory.
+        Salt                    The particular salt system (e.g. 'NaCl').
+        
+        SystemName              The name of the trr and gro files involved in this 
+                                calculation. These should be given the same base name.
         SaveTrajectory          Saves an .xyz trajectory of the predicted 
                                 results when true.
         SaveFeatures            A switch to save the calculated features to a 
@@ -35,68 +57,54 @@ def Check_Structures(WorkDir, Salt, SystemName=None,
                                 predictions to a .pkl file.
         SavePredictionsImage    A switch to save a png image of the calculated 
                                 structure predictions.
-        ML_TimeLength           Controls the particular structure predictor 
-                                model to use.
+        ML_TimeLength           Controls the particular neural network structure predictor 
+                                model to use. This is the total time width in ps. Default 
+                                of 0 indicates a classifier that only depends on one time 
+                                frame.
         ML_TimeStep             Controls the particular structure predictor 
-                                model to use.
+                                model to use. This controls the time step of the neural
+                                network classifier window.
         TimePerFrame            Sets the step size to use between observations
-                                in ps
-        FileType                Sets the structure file type, either gro 
-                                or g96
-        Verbose                 Sets the level of logging verbosity.
-        Startpoint              Initial point to start calculation in the 
-                                trajectory. Default behaviour is to start at 
-                                the first available point in the trajectory.
-        Endpoint                Last time point to end calculation. Default 
-                                behaviour is to end at the last available time
+                                in ps, only meaningful when CheckFullTrajectory 
+                                is True. This does not affect the choice of neural network.
+        FileType                Sets the structure file type, either gro or g96.
+                                
+        Verbose                 Turns on higher logging verbosity when True.
+        
+        Startpoint              [ps] Initial point to start calculation in the trajectory. 
+                                Default behaviour is to start at  the first available 
                                 point in the trajectory.
+        Endpoint                [ps] Last time point to end calculation. Default behaviour 
+                                is to end at the last available time point in the trajectory.
         InMemory                When true, loads the trajectory directly into 
                                 memory, rather than operate on the trajectory 
-                                on disk.
+                                on disk. Not recommended to turn on.
         Temporal_Cutoff         [Frames] Eliminates short-term fluctuations of solids 
                                 in the liquid phase whose timescale is shorter 
-                                than this value.
+                                than this value. Not recommended.
         Voronoi                 Use NN classification models based on Neighbourhoods 
-                                determined by Voronoi tesselation
+                                determined by Voronoi tesselation: Minkowski Structure Metrics.
         Qlm_Average             Use NN classification models based on averaged Qlm 
-                                parameters
-        Prob_Interfacial        Use the probability of structure to classify interfacial 
-                                atoms
+                                parameters. Greatly increases accuracy for almost no extra 
+                                cost  when True.
+        Prob_Interfacial        Sets the weak-classification threshold for classifying 
+                                interfacial atoms in the output trajectory. Disabled by 
+                                default.
         Spatial_Reassignment    Re-assign atom classes based on the class of the surrounding
-                                neighbourhood
+                                neighbourhood. Not recommended.
         Spatial_Interfacial     Re-assign atoms to interfacial if Spatial_Interfacial 
-                                fraction of surrounding atoms are not all at least one class
+                                fraction of surrounding atoms are not all at least one 
+                                class. Not recommended.
         SaveTrajectoryAux       Only applicable when SaveTrajectory is enabled. 
                                 Tells the program how much auxiliary data to export.
                                 0 = No auxiliary data, 1 = max probability of any one class,
                                 2 = also include liquid probability, ... Up to 10.
-        LoadFeatures            Switch to load features if present
+        LoadFeatures            When calculated features were previously saved, set this 
+                                to True to skip the feature calculation step in repeated
+                                computations.
                                 
-    @author: Hayden
+    @author: Hayden O. Scheiber
     """
-    
-    # % Import libraries and define functions
-    import os
-    threads = os.cpu_count()
-    os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # or any {'0', '1', '2'}
-    import tensorflow as tf
-    import MDAnalysis as md
-    import numpy as np
-    import freud
-    freud.parallel.set_num_threads(nthreads=threads)
-    import time
-    import re
-    import warnings
-    import logging
-    import collections
-    
-    if SavePredictionsImage:
-        #from scipy.ndimage.filters import uniform_filter1d
-        import seaborn as sns
-        import matplotlib.pyplot as plt
-    
-    if SaveFeatures or SavePredictions:
-        import pickle
     
     physical_devices = tf.config.list_physical_devices('GPU')
     if len(physical_devices) > 0:
@@ -172,9 +180,11 @@ def Check_Structures(WorkDir, Salt, SystemName=None,
     # Calculation setup and loading the ML model
     
     # Check that the input directory is valid
+    if WorkDir is None:
+        WorkDir = os.getcdw()
+    
     if not os.path.isdir(WorkDir):
         raise NotADirectoryError(WorkDir + ' is not a valid directory.')
-    os.chdir(WorkDir)
     
     # Load some model parameters
     Trial_ID = str(int(ML_TimeLength)) + '-' + str(int(ML_TimeStep))
@@ -197,10 +207,7 @@ def Check_Structures(WorkDir, Salt, SystemName=None,
     if Qlm_Average:
         Trial_ID = Trial_ID + 'a'
     
-    if Version == 1:
-        ML_Name = 'V1NN-' + Trial_ID
-    elif Version == 2:
-        ML_Name = 'V2NN-' + Trial_ID
+    ML_Name = 'V2NN-' + Trial_ID
     Include_Wl = True # includes third order steinhart order parameters (Wl) as features when true
     Include_ID = True # includes atom identity (metal vs halide) as a feature when true
     
@@ -208,62 +215,42 @@ def Check_Structures(WorkDir, Salt, SystemName=None,
     pwd = os.path.abspath(os.path.dirname(__file__))
     MLModelDir = os.path.join(pwd, "ML_Models/")
     
-    if Version == 1:
-        model_loc = os.path.join(MLModelDir,'LiX_Structure_Selector_CNN_Model_' + Trial_ID + '.tf')
-    elif Version == 2:
-        model_loc = os.path.join(MLModelDir,'MX_Structure_Classifier_Model_' + Trial_ID + '.tf')
+    model_loc = os.path.join(MLModelDir,'MX_Structure_Classifier_Model_' + Trial_ID + '.tf')
     
     if not os.path.isdir(model_loc):
         raise FileNotFoundError('Unable to load Structure Selector model from: ' + model_loc + ' (model not found).')
     model = tf.keras.models.load_model(model_loc)
     
-    # Separate the metal and halide 
-    [Metal,Halide] = Separate_Metal_Halide(Salt)
-    
-    # If note give, attempt to find system name
-    # Subdirectory after the salt name should be the system name
+    # If note give, attempt to find system name based on the .trr file in the WorkDir
     if SystemName is None:
-        p = re.compile(Salt + '/(.+?)/{0,1}')
-        SystemName = p.findall(WorkDir)[0]
+        try:
+            WorkDirFiles = os.listdir(WorkDir)
+            trr_file = [i for i in WorkDirFiles if i.endswith('.trr')][0]
+            SystemName = trr_file[:-4]
+        except:
+            raise Exception("Unable to find trajectory file (.trr) in given WorkDir. Try giving explicit SystemName.")
     
-    if Version == 1:
-        labels = ["Liquid","Rocksalt","Wurtzite","5-5","NiAs","Sphalerite","$\\beta$-BeO"]
-        map_dict = {0: "Liquid",
-                    1: "Rocksalt",
-                    2: "Wurtzite",
-                    3: "5-5",
-                    4: "NiAs",
-                    5: "Sphalerite",
-                    6: "b-BeO"}
-        map_label = {0: "L",
-                    1: "R",
-                    2: "W",
-                    3: "F",
-                    4: "N",
-                    5: "S",
-                    6: "B"}
-    else:
-        labels = ["Liquid","Rocksalt","Wurtzite","5-5","NiAs","Sphalerite","$\\beta$-BeO","AntiNiAs","CsCl"]
-        map_dict = {0: "Liquid",
-                    1: "Rocksalt",
-                    2: "Wurtzite",
-                    3: "5-5",
-                    4: "NiAs",
-                    5: "Sphalerite",
-                    6: "b-BeO",
-                    7: "AntiNiAs",
-                    8: "CsCl"}
-        map_label = {0: "L",
-                    1: "R",
-                    2: "W",
-                    3: "F",
-                    4: "N",
-                    5: "S",
-                    6: "B",
-                    7: "A",
-                    8: "C"}
-        
-        n_classes = len(map_dict)
+    labels = ["Liquid","Rocksalt","Wurtzite","5-5","NiAs","Sphalerite","$\\beta$-BeO","AntiNiAs","CsCl"]
+    map_dict = {0: "Liquid",
+                1: "Rocksalt",
+                2: "Wurtzite",
+                3: "5-5",
+                4: "NiAs",
+                5: "Sphalerite",
+                6: "b-BeO",
+                7: "AntiNiAs",
+                8: "CsCl"}
+    map_label = {0: "L",
+                1: "R",
+                2: "W",
+                3: "F",
+                4: "N",
+                5: "S",
+                6: "B",
+                7: "A",
+                8: "C"}
+    
+    n_classes = len(map_dict)
         
     if Spatial_Interfacial is not None or Prob_Interfacial is not None:
         labels.append("Interfacial")
@@ -290,21 +277,42 @@ def Check_Structures(WorkDir, Salt, SystemName=None,
         else:
             grofile = min(list_of_gro_files, key=os.path.getctime)
     if not os.path.isfile(mdpfile):
-        raise FileNotFoundError('Unable to find molecular dynamics parameters file: ' + mdpfile + ' (file not found).')
-    
-    # Check if pbc is on
-    textfile = open(mdpfile, 'r')
-    filetext = textfile.read()
-    textfile.close()
-    if re.findall("pbc\s*=\s*xyz", filetext):
-        pbc_on = True
+        warnings.warn('Unable to find molecular dynamics parameters file: ' + mdpfile + ' (file not found).')
+        pbc_on = True # If no MDP file found, assume PBC is on
     else:
-        pbc_on = False
+        # Check MDP file to determine if pbc is on
+        textfile = open(mdpfile, 'r')
+        filetext = textfile.read()
+        textfile.close()
+        if re.findall("pbc\s*=\s*xyz", filetext):
+            pbc_on = True
+        else:
+            pbc_on = False
         
     # Load the trajectory and grab some basic info
-    with warnings.catch_warnings():
-        warnings.simplefilter('ignore')
-        t = md.Universe(grofile, trajfile, in_memory=InMemory)
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore')
+            t = md.Universe(grofile, trajfile, in_memory=InMemory)
+    except:
+        npz_file = os.path.join(WorkDir, '.' + SystemName + ".trr_offsets.npz")
+        os.remove(npz_file)
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore')
+            t = md.Universe(grofile, trajfile)
+    
+    # Get the metal and halide
+    if Salt is None:
+        Salt = ''.join(list(np.unique(t.atoms.names)))
+        [Metal,Halide] = Separate_Metal_Halide(Salt)
+        Salt = Metal+Halide
+    else:
+        [Metal,Halide] = Separate_Metal_Halide(Salt)
+    
+    # Remove any virtual/shell atoms that may exist
+    ag = t.select_atoms('name ' + Metal + ' or name ' + Halide)
+    t.atoms = ag
+    core_indeces = ag.indices
     
     traj_timestep = (t.trajectory[-1].time - t.trajectory[0].time)/(t.trajectory.n_frames-1) # ps, time per trajectory frame
     if StartPoint is None:
@@ -332,7 +340,7 @@ def Check_Structures(WorkDir, Salt, SystemName=None,
         outfile = os.path.join(SaveDir, ML_Name + '_' + Salt + '_' + SystemName + '.xyz')
     
     # List of index points to examine
-    steps_per_init_frame = int(TimePerFrame/traj_timestep)
+    steps_per_init_frame = int(round(TimePerFrame/traj_timestep))
     Traj_starts = list(range(min_step, max_step+1, steps_per_init_frame)) # Steps
     ML_TimeLength_in_steps = int(np.ceil((ML_TimeLength)/traj_timestep)) # number of trajectory steps required to traverse the CNN time slice
     Half_ML_TimeLength_in_steps = int(np.floor(ML_TimeLength_in_steps/2))
@@ -423,8 +431,8 @@ def Check_Structures(WorkDir, Salt, SystemName=None,
                     box_data = freud.box.Box(1e5,1e5,1e5,0,0,0)
                 
                 # Select out the atoms
-                point_data = ts.positions/10 # in nm
-                system = [box_data,ts.positions/10]
+                point_data = ts.positions[core_indeces]/10 # in nm
+                system = [box_data,ts.positions[core_indeces]/10]
                 
                 # Loop through the N_neighbour_list to built up a set of features
                 fidx = 0
@@ -557,7 +565,7 @@ def Check_Structures(WorkDir, Salt, SystemName=None,
         if SaveTrajectoryAux > 0:
             Certainty_ts = np.split(np.amax(predicted_prob, axis=1,keepdims=True), num_traj_starts, axis=0)
             Probs_ts = np.split(predicted_prob, num_traj_starts, axis=0)
-            aux_dat = np.concatenate((Certainty_ts,Probs_ts), axis=2)[:,:,0:SaveTrajectoryAux]
+            aux_dat = np.concatenate((Certainty_ts,Probs_ts), axis=2)[:,:,0:int(SaveTrajectoryAux)]
         else:
             aux_dat = [None] * num_traj_starts
         
@@ -656,5 +664,5 @@ def Check_Structures(WorkDir, Salt, SystemName=None,
             fig.savefig(ML_Name + '_' + Salt + '_' + SystemName + '.png', dpi=300, format='png')
         else:
             fig.savefig(os.path.join(SaveDir,ML_Name + '_' + Salt + '_' + SystemName + '.png'), dpi=300, format='png')
-        
+    
     return

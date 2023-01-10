@@ -1,68 +1,98 @@
-def Calculate_Liquid_Fraction(WorkDir, Salt, SystemName=None, T=None,
-                              T_Ref=None, RefStructure='Liquid', CheckFullTrajectory=False, 
+# Import libraries
+import os
+import tensorflow as tf
+import MDAnalysis as md
+import numpy as np
+import freud
+import time
+import re
+import warnings
+import logging
+import collections
+from itertools import groupby
+import pickle
+import seaborn as sns
+import matplotlib.pyplot as plt
+from scipy.stats import linregress
+freud.parallel.set_num_threads(nthreads=os.cpu_count())
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # or any {'0', '1', '2'}
+
+def Calculate_Liquid_Fraction(WorkDir=None, Salt=None, SystemName=None,
+                              RefStructure='Liquid', CheckFullTrajectory=False, 
                               SaveTrajectory=False, SaveFeatures=False, 
                               SavePredictions=False, SavePredictionsImage=False,
-                              InitialRefFrac=None, RefChangeThreshold=0.2, 
-                              SlopeThreshold=0.0125, SlopeCheckBegin=0.1,
-                              ML_TimeLength=20, ML_TimeStep=5, TimePerFrame=5, 
-                              FileType='gro', Verbose=False, Version = 2,
-                              Temporal_Cutoff = 0,Voronoi = False, Qlm_Average = True,
-                              Prob_Interfacial = None,Spatial_Reassignment = False,
-                              Spatial_Interfacial = None,
-                              SaveTrajectoryAux = 0):
+                              InitialRefFrac=None, RefChangeThreshold=0.25, 
+                              SlopeThreshold=float('inf'), SlopeCheckBegin=0,
+                              ML_TimeLength=0, ML_TimeStep=0, TimePerFrame=1, 
+                              FileType='gro', Verbose=False, Temporal_Cutoff=0, 
+                              Voronoi=False, Qlm_Average=True, Prob_Interfacial=None, 
+                              Spatial_Reassignment=False, Spatial_Interfacial=None,
+                              SaveTrajectoryAux=2):
     
     """
-    Created on Fri Nov 20 18:54:17 2020
+    Calculate_Liquid_Fraction(WorkDir=None, Salt=None, SystemName=None,
+                                RefStructure='Liquid', CheckFullTrajectory=False, 
+                                SaveTrajectory=False, SaveFeatures=False, 
+                                SavePredictions=False, SavePredictionsImage=False,
+                                InitialRefFrac=None, RefChangeThreshold=0.25, 
+                                SlopeThreshold=float('inf'), SlopeCheckBegin=0,
+                                ML_TimeLength=0, ML_TimeStep=0, TimePerFrame=1, 
+                                FileType='gro', Verbose=False, Temporal_Cutoff=0, 
+                                Voronoi=False, Qlm_Average=True, Prob_Interfacial=None, 
+                                Spatial_Reassignment=False, Spatial_Interfacial=None,
+                                SaveTrajectoryAux=2):
     
-    Calculate_Liquid_Fraction(WorkDir, Salt, SystemName=None, T=None,
-                                  T_Ref=None, RefStructure='Liquid', CheckFullTrajectory=False, 
-                                  SaveTrajectory=False, SaveFeatures=False, 
-                                  SavePredictions=False, SavePredictionsImage=False,
-                                  InitialRefFrac=None, RefChangeThreshold=0.2, 
-                                  SlopeThreshold=0.0125, SlopeCheckBegin=0.1,
-                                  ML_TimeLength=20, ML_TimeStep=5, TimePerFrame=5, 
-                                  FileType='gro', Verbose=False, Version = 2,
-                                  Temporal_Cutoff = 0,Voronoi = False, Qlm_Average = False,
-                                  Prob_Interfacial = None,Spatial_Reassignment = False,
-                                  Spatial_Interfacial = None)
-    This function determines whether a LiX simulation has melted or frozen, 
-    and returns a list of outputs.
+    This function determines whether an alkali halide MD simulation has melted or frozen by
+    computing the fraction of RefStructure, returning a list of useful outputs. 
+    It is based on the alkali halide structure detectors reported in 
+    https://doi.org/10.1063/5.0122274
+    This function is intended for use with the melting point calculation algorithm
+    reported in the above work. RefStructure is best chosen to be the expected solid 
+    crystal structure. If 'Liquid' is chosen as the reference structure, this allows the 
+    solid to be any non-liquid structure. As such, system_frz_alt will always return false.
+    
+    
     Outputs:
-        system_froze            is true if the algorithm detects that the 
+        system_froze            Returns True if the algorithm detects that the 
                                 system freezes.
-        system_melted           is true if the algorithm detects that the 
+        system_melted           Returns True if the algorithm detects that the 
                                 system melts.
-        time_to_phase_change    is number indicating the time (in ps) at which 
+        time_to_phase_change    A number indicating the time (in ps) at which 
                                 the phase change occurs.
-        
-    Inputs (Required):
-        WorkDir                 The directory containing the trajectory, 
-                                and will also contain any output files.
-        MLModelDir              The directory containing the ML structure 
-                                predictor to be used.
-        Salt                    The LiX salt.
+        final_ref_frac          Fraction of RefStructure remaining at the end of the 
+                                given trajectory.
+        final_liq_frac          Fraction of Liquid remaining at the end of the 
+                                given trajectory.
+        system_frz_alt          Returns True if the algorithm detects the system freezing 
+                                into a crystal structure other than RefStructure
         
     Inputs (Optional):
-        SystemName              The name of the files involved in this calculation.
-        T_Ref                   The reference temperature used to generate the
-                                system geometry.
-        T                       The actual system temperature.
+        WorkDir                 The directory containing the trajectory, and will also 
+                                contain any output files. Default is the current working 
+                                directory.
+        Salt                    The particular salt system (e.g. 'NaCl').
+        
+        SystemName              The name of the trr and gro files involved in this 
+                                calculation. These should be given the same base name.
+        
         RefStructure            Tells the algorithm which structure to check 
-                                for melting/freezing.
-        CheckFullTrajectory     Checks the entire trajectory when true, or 
-                                only the final time point when false. Note that 
-                                when false, the time_to_phase_change output is 
+                                for melting/freezing. If a solid structure is selected,
+                                the algorithm checks both the liquid and the solid.
+        CheckFullTrajectory     Checks the entire trajectory when True (slower), or 
+                                only the final time point when False (faster). Note that 
+                                when False, the time_to_phase_change output is 
                                 set to NaN.
-        SaveTrajectory          Saves an .xyz trajectory of the predicted 
-                                results when true.
-        SaveFeatures            A switch to save the calculated features to a 
-                                .pkl file.
+        SaveTrajectory          Saves an .xyz trajectory of the predicted results when True.
+                                
+        SaveFeatures            A switch to save the calculated features to a .pkl file.
+        
         SavePredictions         A switch to saved the calculated structure 
                                 predictions to a .pkl file.
         SavePredictionsImage    A switch to save a png image of the calculated 
                                 structure predictions.
         InitialRefFrac          What fraction of the system is initiall in the 
-                                reference structure?
+                                reference structure? If left as None, will be calculated 
+                                automatically.
         RefChangeThreshold      If RefChangeThrehold is a number between 0 and 1, then
                                 it corresponds to the minimum change in the 
                                 fraction of RefStructure required to indicate 
@@ -70,69 +100,50 @@ def Calculate_Liquid_Fraction(WorkDir, Salt, SystemName=None, T=None,
                                 is a number greater than 1, then RefChangeThreshold
                                 indicates the absolute number of atoms that must change
                                 phase in order to indicate a phase change has completed.
-        SlopeThreshold          A second requirement: the change in the asbolute number or
+        SlopeThreshold          (Depreciated) The change in the absolute number or
                                 fraction per unit time must be smaller than the 
                                 absolute value of this threshold for the system 
                                 to be considered at the melting point. Units of
-                                [Structure Fraction/ps] or [atoms/ps]
-        SlopeCheckBegin         At what fraction [0,1) of the total trajectory to 
-                                start using data for the slope. This should be 
-                                slightly greater than 0 to avoid incorporating
-                                changes due to the establishment of equilibrium.
-        ML_TimeLength           Controls the particular structure predictor 
-                                model to use.
+                                [Structure Fraction/ps] or [atoms/ps].
+        SlopeCheckBegin         At what fraction [0,1] of the total trajectory to 
+                                start using data for the slope.
+        ML_TimeLength           Controls the particular neural network structure predictor 
+                                model to use. This is the total time width in ps. Default 
+                                of 0 indicates a classifier that only depends on one time 
+                                frame.
         ML_TimeStep             Controls the particular structure predictor 
-                                model to use.
+                                model to use. This controls the time step of the neural
+                                network classifier window.
         TimePerFrame            Sets the step size to use between observations
                                 in ps, only meaningful when CheckFullTrajectory 
-                                is True
-        FileType                Sets the structure file type, either gro 
-                                or g96
-        Verbose                 Sets the level of logging verbosity.    
+                                is True. This does not affect the choice of neural network.
+        FileType                Indicates the structure file type, either gro or g96.
+                                
+        Verbose                 Turns on higher logging verbosity when True.
+        
         Temporal_Cutoff         [Frames] Eliminates short-term fluctuations of solids 
                                 in the liquid phase whose timescale is shorter 
-                                than this value.
+                                than this value. Not recommended.
         Voronoi                 Use NN classification models based on Neighbourhoods 
-                                determined by Voronoi tesselation
+                                determined by Voronoi tesselation: Minkowski Structure Metrics.
         Qlm_Average             Use NN classification models based on averaged Qlm 
-                                parameters
-        Prob_Interfacial        Use the probability of structure to classify interfacial 
-                                atoms
+                                parameters. Greatly increases accuracy for almost no extra 
+                                cost  when True.
+        Prob_Interfacial        Sets the weak-classification threshold for classifying 
+                                interfacial atoms in the output trajectory. Disabled by 
+                                default.
         Spatial_Reassignment    Re-assign atom classes based on the class of the surrounding
-                                neighbourhood
+                                neighbourhood. Not recommended.
         Spatial_Interfacial     Re-assign atoms to interfacial if Spatial_Interfacial 
-                                fraction of surrounding atoms are not all at least one class
+                                fraction of surrounding atoms are not all at least one 
+                                class. Not recommended.
         SaveTrajectoryAux       Only applicable when SaveTrajectory is enabled. 
                                 Tells the program how much auxiliary data to export.
                                 0 = No auxiliary data, 1 = max probability of any one class,
                                 2 = also include liquid probability, ... Up to 10.
     
-    @author: Hayden
+    @author: Hayden O. Scheiber
     """
-    
-    # % Import libraries and define functions
-    import os
-    threads = os.cpu_count()
-    os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # or any {'0', '1', '2'}
-    import tensorflow as tf
-    import MDAnalysis as md
-    import numpy as np
-    import freud
-    freud.parallel.set_num_threads(nthreads=threads)
-    import time
-    import re
-    import warnings
-    import logging
-    import collections
-
-    if CheckFullTrajectory:
-        from scipy.stats import linregress
-        if SavePredictionsImage:
-            import seaborn as sns
-            import matplotlib.pyplot as plt
-    
-    if SaveFeatures or SavePredictions:
-        import pickle
     
     physical_devices = tf.config.list_physical_devices('GPU')
     if len(physical_devices) > 0:
@@ -231,13 +242,15 @@ def Calculate_Liquid_Fraction(WorkDir, Salt, SystemName=None, T=None,
     # Calculation setup and loading the ML model
     
     # Check that the input directory is valid
+    if WorkDir is None:
+        WorkDir = os.getcdw()
+    
     if not os.path.isdir(WorkDir):
         raise NotADirectoryError(WorkDir + ' is not a valid directory.')
-    os.chdir(WorkDir)
     
     RefStructure = GetRefStructure(RefStructure)
     
-    # Load some model parameters
+    # Load some model architecture parameters
     Trial_ID = str(int(ML_TimeLength)) + '-' + str(int(ML_TimeStep))
     if Trial_ID == '0-1':
         N_neighbour_list = [4,6,18] # List of nearest neighbour numbers to calculate order parameters
@@ -258,10 +271,7 @@ def Calculate_Liquid_Fraction(WorkDir, Salt, SystemName=None, T=None,
     if Qlm_Average:
         Trial_ID = Trial_ID + 'a'
     
-    if Version == 1:
-        ML_Name = 'V1NN-' + Trial_ID
-    elif Version == 2:
-        ML_Name = 'V2NN-' + Trial_ID
+    ML_Name = 'V2NN-' + Trial_ID
     Include_Wl = True # includes third order steinhart order parameters (Wl) as features when true
     Include_ID = True # includes atom identity (metal vs halide) as a feature when true
     
@@ -269,60 +279,40 @@ def Calculate_Liquid_Fraction(WorkDir, Salt, SystemName=None, T=None,
     pwd = os.path.abspath(os.path.dirname(__file__))
     MLModelDir = os.path.join(pwd, "ML_Models/")
     
-    if Version == 1:
-        model_loc = os.path.join(MLModelDir,'LiX_Structure_Selector_CNN_Model_' + Trial_ID + '.tf')
-    elif Version == 2:
-        model_loc = os.path.join(MLModelDir,'MX_Structure_Classifier_Model_' + Trial_ID + '.tf')
+    model_loc = os.path.join(MLModelDir,'MX_Structure_Classifier_Model_' + Trial_ID + '.tf')
     
     if not os.path.isdir(model_loc):
         raise FileNotFoundError('Unable to load Structure Selector model from: ' + model_loc + ' (model not found).')
     model = tf.keras.models.load_model(model_loc)
     
-    # Separate the metal and halide 
-    [Metal,Halide] = Separate_Metal_Halide(Salt)
-    
-    # If note give, attempt to find system name
-    # Subdirectory after the salt name should be the system name
+    # If note give, attempt to find system name based on the .trr file in the WorkDir
     if SystemName is None:
-        p = re.compile(Salt + '/(.+?)/{0,1}')
-        SystemName = p.findall(WorkDir)[0]
+        try:
+            WorkDirFiles = os.listdir(WorkDir)
+            trr_file = [i for i in WorkDirFiles if i.endswith('.trr')][0]
+            SystemName = trr_file[:-4]
+        except:
+            raise Exception("Unable to find trajectory file (.trr) in given WorkDir. Try giving explicit SystemName.")
     
-    if Version == 1:
-        labels = ["Liquid","Rocksalt","Wurtzite","5-5","NiAs","Sphalerite","$\\beta$-BeO"]
-        map_dict = {0: "Liquid",
-                    1: "Rocksalt",
-                    2: "Wurtzite",
-                    3: "5-5",
-                    4: "NiAs",
-                    5: "Sphalerite",
-                    6: "b-BeO"}
-        map_label = {0: "L",
-                    1: "R",
-                    2: "W",
-                    3: "F",
-                    4: "N",
-                    5: "S",
-                    6: "B"}
-    else:
-        labels = ["Liquid","Rocksalt","Wurtzite","5-5","NiAs","Sphalerite","$\\beta$-BeO","AntiNiAs","CsCl"]
-        map_dict = {0: "Liquid",
-                    1: "Rocksalt",
-                    2: "Wurtzite",
-                    3: "5-5",
-                    4: "NiAs",
-                    5: "Sphalerite",
-                    6: "b-BeO",
-                    7: "AntiNiAs",
-                    8: "CsCl"}
-        map_label = {0: "L",
-                    1: "R",
-                    2: "W",
-                    3: "F",
-                    4: "N",
-                    5: "S",
-                    6: "B",
-                    7: "A",
-                    8: "C"}
+    labels = ["Liquid","Rocksalt","Wurtzite","5-5","NiAs","Sphalerite","$\\beta$-BeO","AntiNiAs","CsCl"]
+    map_dict = {0: "Liquid",
+                1: "Rocksalt",
+                2: "Wurtzite",
+                3: "5-5",
+                4: "NiAs",
+                5: "Sphalerite",
+                6: "b-BeO",
+                7: "AntiNiAs",
+                8: "CsCl"}
+    map_label = {0: "L",
+                1: "R",
+                2: "W",
+                3: "F",
+                4: "N",
+                5: "S",
+                6: "B",
+                7: "A",
+                8: "C"}
     
     n_classes = len(map_dict)
     
@@ -334,14 +324,10 @@ def Calculate_Liquid_Fraction(WorkDir, Salt, SystemName=None, T=None,
         n_classes += 1
     
     ref_idx = list(map_dict.keys())[list(map_dict.values()).index(RefStructure)]
-    
-    if T_Ref is None:
-        T_txt = ""
-    else:
-        T_txt = f"_{T_Ref:.4f}"
+    liq_idx = list(map_dict.keys())[list(map_dict.values()).index('Liquid')]
     
     trajfile = os.path.join(WorkDir, SystemName + "." + 'trr')
-    grofile = os.path.join(WorkDir, SystemName + T_txt + "." + FileType)
+    grofile = os.path.join(WorkDir, SystemName + "." + FileType)
     mdpfile = os.path.join(WorkDir, SystemName + "." + 'mdp')
     
     # Check that the required files exist
@@ -350,21 +336,42 @@ def Calculate_Liquid_Fraction(WorkDir, Salt, SystemName=None, T=None,
     if not os.path.isfile(grofile):
         raise FileNotFoundError('Unable to find initial system geometry file: ' + grofile + ' (file not found).')
     if not os.path.isfile(mdpfile):
-        raise FileNotFoundError('Unable to find molecular dynamics parameters file: ' + mdpfile + ' (file not found).')
-    
-    # Check if pbc is on
-    textfile = open(mdpfile, 'r')
-    filetext = textfile.read()
-    textfile.close()
-    if re.findall("pbc\s*=\s*xyz", filetext):
-        pbc_on = True
+        warnings.warn('Unable to find molecular dynamics parameters file: ' + mdpfile + ' (file not found).')
+        pbc_on = True # If no MDP file found, assume PBC is on
     else:
-        pbc_on = False
+        # Check if PBC is on
+        textfile = open(mdpfile, 'r')
+        filetext = textfile.read()
+        textfile.close()
+        if re.findall("pbc\s*=\s*xyz", filetext):
+            pbc_on = True
+        else:
+            pbc_on = False
         
     # Load the trajectory and grab some basic info
-    with warnings.catch_warnings():
-        warnings.simplefilter('ignore')
-        t = md.Universe(grofile, trajfile)
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore')
+            t = md.Universe(grofile, trajfile)
+    except:
+        npz_file = os.path.join(WorkDir, '.' + SystemName + ".trr_offsets.npz")
+        os.remove(npz_file)
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore')
+            t = md.Universe(grofile, trajfile)
+    
+    # Get the metal and halide
+    if Salt is None:
+        Salt = ''.join(list(np.unique(t.atoms.names)))
+        [Metal,Halide] = Separate_Metal_Halide(Salt)
+        Salt = Metal+Halide
+    else:
+        [Metal,Halide] = Separate_Metal_Halide(Salt)
+    
+    # Remove any virtual/shell atoms that may exist
+    ag = t.select_atoms('name ' + Metal + '+ or name ' + Halide + '- or name ' + Metal + ' or name ' + Halide)
+    t.atoms = ag
+    core_indeces = ag.indices
     
     traj_timestep = (t.trajectory[-1].time - t.trajectory[0].time)/(t.trajectory.n_frames-1) # ps, time per trajectory frame
     if CheckFullTrajectory:
@@ -478,8 +485,8 @@ def Calculate_Liquid_Fraction(WorkDir, Salt, SystemName=None, T=None,
             
             # Select out the atoms
             
-            point_data = ts.positions/10 # in nm
-            system = [box_data,ts.positions/10]
+            point_data = ts.positions[core_indeces]/10 # in nm
+            system = [box_data,ts.positions[core_indeces]/10]
             
             # Loop through the N_neighbour_list to built up a set of features
             fidx = 0
@@ -495,12 +502,13 @@ def Calculate_Liquid_Fraction(WorkDir, Salt, SystemName=None, T=None,
                     # Construct the neighbour filter and build
                     query_args = dict(mode='nearest', num_neighbors=N_neighbour, exclude_ii=True)
                     nlist = freud.locality.AABBQuery(box_data, point_data).query(point_data, query_args).toNeighborList()
-                
+                    
                 if Save_Neighbour and (Neighbour_idx+1 == len(N_neighbour_list)):
                     Neighbourlist_slice[t_idx] = nlist
                     if t_idx == central_idx:
                         Neighbourlist_list.append(nlist)
                 
+                ttime1 = time.time()
                 for L in L_list[Neighbour_idx]:
                     ql = freud.order.Steinhardt(L,wl=Include_Wl,
                                                 wl_normalize=True,
@@ -553,7 +561,6 @@ def Calculate_Liquid_Fraction(WorkDir, Salt, SystemName=None, T=None,
     
     # Convert to predictions and convert back to time slices
     pred_class = np.array(np.split(np.argmax(predicted_prob, axis=1), num_traj_starts, axis=0))
-    
     logging.info('\nFinished Inferring Predictions.')
     
     # Applying various post-processing elements
@@ -608,7 +615,7 @@ def Calculate_Liquid_Fraction(WorkDir, Salt, SystemName=None, T=None,
         if SaveTrajectoryAux > 0:
             Certainty_ts = np.split(np.amax(predicted_prob, axis=1,keepdims=True), num_traj_starts, axis=0)
             Probs_ts = np.split(predicted_prob, num_traj_starts, axis=0)
-            aux_dat = np.concatenate((Certainty_ts,Probs_ts), axis=2)[:,:,0:SaveTrajectoryAux]
+            aux_dat = np.concatenate((Certainty_ts,Probs_ts), axis=2)[:,:,0:int(SaveTrajectoryAux)]
         else:
             aux_dat = [None] * num_traj_starts
         
@@ -682,8 +689,8 @@ def Calculate_Liquid_Fraction(WorkDir, Salt, SystemName=None, T=None,
                 box_data = freud.box.Box(1e5,1e5,1e5,0,0,0)
             
             # Select out the atoms
-            point_data = ts.positions/10 # in nm
-            system = [box_data,ts.positions/10]
+            point_data = ts.positions[core_indeces]/10 # in nm
+            system = [box_data,ts.positions[core_indeces]/10]
             
             # Loop through the N_neighbour_list to built up a set of features
             fidx = 0
@@ -721,7 +728,7 @@ def Calculate_Liquid_Fraction(WorkDir, Salt, SystemName=None, T=None,
             Ql_result_traj[t_idx] = np.column_stack(Ql_result)
         
         if timeless:
-            Ql_initial = Ql_result_traj
+            Ql_initial = Ql_result_traj[0,:,:]
         else:
             Ql_initial = Ql_result_traj.transpose(1, 0, 2)
         
@@ -757,6 +764,11 @@ def Calculate_Liquid_Fraction(WorkDir, Salt, SystemName=None, T=None,
         d = hist_laxis(predicted_classes_init, n_classes, [0,n_classes])
         d_norm = d/t.atoms.n_atoms
         InitialRefFrac = d_norm[ref_idx]
+        InitialLiqFrac = d_norm[liq_idx]
+        if liq_idx != ref_idx:
+            logging.info('\nInitial Fraction of ' + map_dict[liq_idx] + 
+                         ' Phase is: {:.2f} %.'.format(
+                             InitialLiqFrac*100))
         logging.info('\nInitial Fraction of ' + map_dict[ref_idx] + 
                      ' Phase is: {:.2f} %. Time to calculate: {:.1f} s.'.format(
                          InitialRefFrac*100,
@@ -799,10 +811,17 @@ def Calculate_Liquid_Fraction(WorkDir, Salt, SystemName=None, T=None,
         d = hist_laxis(predicted_classes_init, n_classes, [0,n_classes])
         d_norm = d/t.atoms.n_atoms
         InitialRefFrac = d_norm[ref_idx]
+        InitialLiqFrac = d_norm[liq_idx]
+        if liq_idx != ref_idx:
+            logging.info('\nInitial Fraction of ' + map_dict[liq_idx] + 
+                         ' Phase is: {:.2f} %.'.format(
+                             InitialLiqFrac*100))
         logging.info('\nInitial Fraction of ' + map_dict[ref_idx] + 
                      ' Phase is: {:.2f} %. Time to calculate: {:.1f} s.'.format(
                          InitialRefFrac*100,
                          time.time() - t_if))
+    else:
+        InitialLiqFrac = 1 - InitialRefFrac
     
     # Finally, generate a series of line plots: partitions vs time
     y_max = 100
@@ -815,6 +834,7 @@ def Calculate_Liquid_Fraction(WorkDir, Salt, SystemName=None, T=None,
     d = hist_laxis(predicted_classes, n_classes, [0,n_classes])
     d_norm = d/t.atoms.n_atoms
     final_ref_frac = d_norm[-1,ref_idx]
+    final_liq_frac = d_norm[-1,liq_idx]
     x = np.array([i * traj_timestep + min_traj_time for i in Traj_starts])
     
     if CheckFullTrajectory and SavePredictionsImage:
@@ -837,14 +857,7 @@ def Calculate_Liquid_Fraction(WorkDir, Salt, SystemName=None, T=None,
             plt.plot(x,y_dat_metal*100, label=labels[idx], color=cols[idx], alpha=0.8, linewidth=2, linestyle='solid')
             plt.plot(x,y_dat_halide*100, label=None, color=cols[idx], alpha=0.8, linewidth=2, linestyle='dashed')
         
-        if T is None:
-            T_txt1 = ""
-            T_txt2 = ""
-        else:
-            T_txt1 = f" T = {T:.4f} K"
-            T_txt2 = f"T_{T:.4f}"
-        
-        plt.title('[' + ML_Name + ']: ' + SystemName + T_txt1)
+        plt.title('[' + ML_Name + ']: ' + SystemName)
         plt.grid()
         plt.xlabel('Trajectory Time [ps]')
         plt.ylabel('Fraction in Structure [%]')
@@ -853,28 +866,37 @@ def Calculate_Liquid_Fraction(WorkDir, Salt, SystemName=None, T=None,
         if y_max < 100:
             plt.ylim([0,y_max])
         
-        fig.savefig(ML_Name + '_' + Salt + '_' + SystemName + T_txt2 + '.png', dpi=300, format='png')
+        fig.savefig(ML_Name + '_' + Salt + '_' + SystemName + '.png', dpi=300, format='png')
         plt.close(fig)
     
     # Determine the fraction of liquid, find first time step where liquid becomes less than or greater than the given threshold 
     system_melting = False
     system_freezing = False
+    system_frzing_alt = False
             
     # Leave SlopeThreshold and InitialRefFrac as fractions or convert them to absolute numbers
     if RefChangeThreshold <= 1:
-        Threshold_Upper = min(InitialRefFrac + RefChangeThreshold,0.85) # Above this number indicates melting/freezing [liquid/solid]
-        Threshold_Lower = max(InitialRefFrac - RefChangeThreshold,0.15) # Below this number indicates freezing/melting [liquid/solid]
+        Threshold_Upper_sol = min(InitialRefFrac + RefChangeThreshold,0.95) # Above this number indicates melting/freezing [solid]
+        Threshold_Lower_sol = max(InitialRefFrac - RefChangeThreshold,0.05) # Below this number indicates freezing/melting [solid]
+        Threshold_Upper_liq = min(InitialLiqFrac + RefChangeThreshold,0.95) # Above this number indicates melting/freezing [liquid]
+        Threshold_Lower_liq = max(InitialLiqFrac - RefChangeThreshold,0.05) # Below this number indicates freezing/melting [liquid]
         ref_fraction = d_norm[:,ref_idx]
+        liq_fraction = d_norm[:,liq_idx]
     else: # Convert to absolute units
         ref_fraction = d[:,ref_idx]
+        liq_fraction = d[:,liq_idx]
         SlopeThreshold = SlopeThreshold*t.atoms.n_atoms # [Structure Fraction/ps] -> [Atoms/ps]
         InitialRefFrac = InitialRefFrac*t.atoms.n_atoms # Initial fraction -> Initial Num atoms
-        Threshold_Upper = min(InitialRefFrac + RefChangeThreshold,t.atoms.n_atoms*0.85) # Above this number indicates melting/freezing [liquid/solid]
-        Threshold_Lower = max(InitialRefFrac - RefChangeThreshold,t.atoms.n_atoms*0.15) # Below this number indicates freezing/melting [liquid/solid]
-    
+        InitialLiqFrac = InitialLiqFrac*t.atoms.n_atoms # Initial fraction -> Initial Num atoms
+        Threshold_Upper_sol = min(InitialRefFrac + RefChangeThreshold,t.atoms.n_atoms*0.95) # Above this number indicates melting/freezing [liquid/solid]
+        Threshold_Lower_sol = max(InitialRefFrac - RefChangeThreshold,t.atoms.n_atoms*0.05) # Below this number indicates freezing/melting [liquid/solid]
+        Threshold_Upper_liq = min(InitialLiqFrac + RefChangeThreshold,t.atoms.n_atoms*0.95) # Above this number indicates melting/freezing [liquid/solid]
+        Threshold_Lower_liq = max(InitialLiqFrac - RefChangeThreshold,t.atoms.n_atoms*0.05) # Below this number indicates freezing/melting [liquid/solid]
+        
     if ref_idx == 0: # Reference Structure is Liquid
-        is_frozen = ref_fraction <= Threshold_Lower
-        is_melted = ref_fraction >= Threshold_Upper
+        is_frozen = ref_fraction <= Threshold_Lower_liq
+        is_melted = ref_fraction >= Threshold_Upper_liq
+        is_frozen_alt = np.array([False]) # unable to check if only looking at liquid
         # Check slope of last 90% of trajectory (fit linear regression)
         if CheckFullTrajectory:
             x1 = x[x >= max_time*SlopeCheckBegin] # [ps] time points
@@ -883,30 +905,56 @@ def Calculate_Liquid_Fraction(WorkDir, Salt, SystemName=None, T=None,
             slope = regmodel.slope
             if slope > SlopeThreshold:
                 system_melting = True
-                est_time_to_phase_change = (Threshold_Upper - y1[0])/slope + x1[0]
+                est_time_to_phase_change = (Threshold_Upper_liq - y1[0])/slope + x1[0]
             elif slope < -SlopeThreshold:
                 system_freezing = True
-                est_time_to_phase_change = (Threshold_Lower - y1[0])/slope + x1[0]
+                est_time_to_phase_change = (Threshold_Lower_liq - y1[0])/slope + x1[0]
 
     else: # Reference structure is a solid structure
-        is_frozen = ref_fraction >= Threshold_Upper
-        is_melted = ref_fraction <= Threshold_Lower
-        # Check slope of last 90% of trajectory
+        is_frozen_sol = ref_fraction >= Threshold_Upper_sol
+        is_melted_sol = ref_fraction <= Threshold_Lower_sol
+        
+        is_frozen_liq = liq_fraction <= Threshold_Lower_liq
+        is_melted_liq = liq_fraction >= Threshold_Upper_liq
+        
+        is_frozen = is_frozen_sol | is_frozen_liq
+        is_melted = is_melted_sol | is_melted_liq
+        
+        alt_fraction = 1 - (liq_fraction + ref_fraction)
+        is_frozen_alt = (alt_fraction >= RefChangeThreshold) & (alt_fraction > ref_fraction)
+        
+        # Check slope of last $SlopeCheckBegin% of trajectory
         if CheckFullTrajectory:
             x1 = x[x >= max_time*SlopeCheckBegin] # [ps] time points
             y1 = ref_fraction[x >= max_time*SlopeCheckBegin] # fraction (or absolute number) of reference structure
-            regmodel = linregress(x1, y1)
-            slope = regmodel.slope
-            if slope > SlopeThreshold:
+            y2 = liq_fraction[x >= max_time*SlopeCheckBegin]
+            y3 = alt_fraction[x >= max_time*SlopeCheckBegin]
+            regmodel_sol = linregress(x1, y1)
+            regmodel_liq = linregress(x1, y2)
+            regmodel_alt = linregress(x1, y3)
+            slope_sol = regmodel_sol.slope
+            slope_liq = regmodel_liq.slope
+            slope_alt = regmodel_alt.slope
+            if slope_sol > SlopeThreshold:
                 system_freezing = True
-                est_time_to_phase_change = (Threshold_Upper - y1[0])/slope + x1[0]
-            elif slope < -SlopeThreshold:
+                est_time_to_phase_change = (Threshold_Upper_sol - y1[0])/slope_sol + x1[0]
+            elif slope_liq < -SlopeThreshold:
+                system_freezing = True
+                est_time_to_phase_change = (Threshold_Upper_liq - y2[0])/slope_liq + x1[0]
+            elif slope_sol < -SlopeThreshold:
                 system_melting = True
-                est_time_to_phase_change = (Threshold_Lower - y1[0])/slope + x1[0]
+                est_time_to_phase_change = (Threshold_Lower_sol - y1[0])/slope_sol + x1[0]
+            elif slope_liq > SlopeThreshold:
+                system_melting = True
+                est_time_to_phase_change = (Threshold_Lower_liq - y2[0])/slope_liq + x1[0]
+            elif slope_alt > SlopeThreshold:
+                system_frzing_alt = True
+                est_time_to_phase_change = (RefChangeThreshold - y3[0])/slope_sol + x1[0]
 
     # If system is passed the threshold into frozen or melting, use that
     system_froze = any(is_frozen)
     system_melted = any(is_melted)
+    system_frz_alt = any(is_frozen_alt) | system_frzing_alt
     
     # Otherwise, if the system is not yet frozen or melting, check if it is freezing/melting based on slope
     if not system_froze and not system_melted:
@@ -923,7 +971,7 @@ def Calculate_Liquid_Fraction(WorkDir, Salt, SystemName=None, T=None,
             system_melted = True
     
     # If liquid has neither fully melted nor fully frozen, report back
-    if not system_froze and not system_melted:
+    if not system_froze and not system_melted and not system_frz_alt:
         time_to_phase_change = np.nan
     elif system_froze:
         if any(is_frozen):
@@ -938,7 +986,14 @@ def Calculate_Liquid_Fraction(WorkDir, Salt, SystemName=None, T=None,
             time_to_phase_change = x[idx_phase_change]
         else:
             time_to_phase_change = est_time_to_phase_change
+    elif system_frz_alt:
+        if any(is_frozen_alt):
+            idx_phase_change = np.where(is_frozen_alt)[0][0]
+            time_to_phase_change = x[idx_phase_change]
+        else:
+            time_to_phase_change = est_time_to_phase_change
+        
     if not CheckFullTrajectory:
         time_to_phase_change = np.nan
     
-    return [system_froze,system_melted,time_to_phase_change,final_ref_frac]
+    return [system_froze,system_melted,time_to_phase_change,final_ref_frac,final_liq_frac,system_frz_alt]
