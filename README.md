@@ -51,6 +51,7 @@ The default behaviour is to find the `*.trr` file in the `WorkDir` (by default, 
 |10|5|**True**|False|10-5v|98.42|
 |20|5|**True**|False|20-5v|99.25|
 |50|5|**True**|False|50-5v|99.82|
+
 The accuracy column refers to average accuracy when each classifier was tested on 9 million data points from a set of bulk systems of known structure that were not used in the training process. In general, I suggest using the default `Qlm_Average=True` unless you have a good reason not to. These classifiers have significantly higher accuracy with little additional computational cost. The main trade-off in using `Qlm_Average=True` is that very small structures may be missed due to spatial averaging. Modifying `ML_TimeLength` and `ML_TimeStep` from the default (`0` and `0`) turns on *time convolution* which increases accuracy by averaging out instantaneous thermal fluctuations. Use of this feature requires that trajectory time steps are saved in `ML_TimeStep` increments and the trajectory for analysis must be at least `ML_TimeLength` ps in length.
 
 See the documentation available with each individual function for more details.
